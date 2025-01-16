@@ -22,6 +22,26 @@ parser = ArgumentParser(
     formatter_class=ArgumentDefaultsHelpFormatter,
 )
 
+import time
+
+
+def printChStatus(device, slot, ch):
+    """print out Vmon/Imon/Status/Pw/Temp"""
+    values = []
+    param_list = ['VMon','IMon','Status','Pw','Temp']
+    for param_name in param_list:
+        param_prop = device.get_ch_param_prop(slot, ch, param_name)
+        if param_prop.mode is not hv.ParamMode.WRONLY:
+            values.append(device.get_ch_param(slot, [ch], param_name))
+    out = "Status of slot %d Ch %d: "%(slot, ch)
+    for index, param_name in enumerate(param_list):
+        if param_name == 'Pw':
+            out = out + " Pw = %d; "%values[index][0]
+        else:
+            out = out + "%s = %.1f; "%(param_name, values[index][0])
+    print(out)
+    return 0
+
 # Shared parser for subcommands
 parser.add_argument('-s', '--systemtype', type=str, help='system type', required=True, choices=tuple(i.name for i in hv.SystemType))
 parser.add_argument('-l', '--linktype', type=str, help='system type', required=True, choices=tuple(i.name for i in hv.LinkType))
@@ -64,7 +84,9 @@ with hv.Device.open(hv.SystemType[args.systemtype], hv.LinkType[args.linktype], 
                 device.subscribe_board_params(slot, [param_name])
         for ch in range(board.n_channel):
             ch_params = device.get_ch_param_info(slot, ch)
+            #print("all ch params ", ch_params)
             for param_name in ch_params:
+                #print("param_name ", param_name, " type ", type(param_name))
                 param_prop = device.get_ch_param_prop(slot, ch, param_name)
                 print('CH_PARAM', slot, ch, param_name, param_prop.type.name)
                 if param_prop.mode is not hv.ParamMode.WRONLY:
@@ -72,8 +94,23 @@ with hv.Device.open(hv.SystemType[args.systemtype], hv.LinkType[args.linktype], 
                     print('VALUE', param_value)
                     device.subscribe_channel_params(slot, ch, [param_name])
 
+    #printChStatus(device, 5, 6)
+    #device.set_ch_param(5, [6], 'V0Set', 25.0)
+    #device.set_ch_param(5, [6], 'Pw', True)
+    #time.sleep(10.0) ### wait for 10 seconds 
+    #printChStatus(device, 5, 6)
+    #time.sleep(10.0) ### wait for 10 seconds 
+    #printChStatus(device, 5, 6)
+    #time.sleep(60.0) ### wait for 10 seconds 
+    #device.set_ch_param(5, [6], 'Pw', False)
+    #time.sleep(10.0) ### wait for 10 seconds 
+    #printChStatus(device, 5, 6)
+    #time.sleep(10.0) ### wait for 10 seconds 
+    #printChStatus(device, 5, 6)
+
+    ## set voltage=25V for board in slot 5, ch 6, and print Vmon/Imon/Status/Pw/Temp
     # Listen for events
-    for _ in range(10):
-        evt_list, _ = device.get_event_data()
-        for evt in evt_list:
-            print(evt)
+    #for _ in range(10):
+    #    evt_list, _ = device.get_event_data()
+    #    for evt in evt_list:
+    #        print(evt)
