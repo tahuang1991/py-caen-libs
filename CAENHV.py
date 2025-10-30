@@ -6,6 +6,7 @@ Check CAEN HV Wrapper Library for more info
 Tao Huang, 2025 March
 """
 
+from pyparsing import wraps
 from caen_libs import caenhvwrapper as hvwrapper
 
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
@@ -27,21 +28,27 @@ except ModuleNotFoundError:
 from math import ceil
 
 def auto_connect_disconnect(func):
+    @wraps(func)
     def wrapper(self, *args, **kwargs):
+        # Ensure the device is connected (or already connected) before calling the wrapped function.
+        no_device =  self.device is None
+        if no_device:
+            try:
+                self.reconfig()
+            except RuntimeError as e:
+                if self.device is None:
+                    raise RuntimeError("Failed to connect to the CAEN HV device. Please check the connection.") from e
+
+        # Call the wrapped function and attempt to disconnect afterwards.
         try:
-            self.reconnect()
-        except RuntimeError as e:
-            if "Already connected." in str(e):  # Check the specific error message
-                #print("Connection already established. Skipping reconnection.")
-                pass
-            elif "CAENHV_InitSystem failed:" in str(e):
-                raise("Failed to connect to the CAEN HV device. Please check the connection.")
-            else:
-                raise("Failed to connect to the CAEN HV device for unknow reason: ", str(e))  # Re-raise unexpected errors
-        finally:
             result = func(self, *args, **kwargs)
-            self.disconnect()
-            
+        finally:
+            if no_device: ## only disconnect if we had to connect here
+                try:
+                    self.disconnect()
+                except Exception:
+                    if getattr(self, 'verbose', False):
+                        print("Warning: disconnect raised an exception")
         return result
     return wrapper
 
@@ -59,6 +66,9 @@ class CAENHV():
         self.device = None
         self.slots = []
         self.sys_props = []
+        # Timestamp until which the device is considered "dispatched" (temporarily closed)
+        # If now < _dispatched_until, reconnect attempts should be refused.
+        self._dispatched_until = 0.0
         
         allSystemType = [i.name for i in hvwrapper.SystemType]
         allLinkType = [i.name for i in hvwrapper.LinkType]
@@ -71,9 +81,8 @@ class CAENHV():
             self.device = hvwrapper.Device.open(hvwrapper.SystemType[self.systemtype], hvwrapper.LinkType[self.linktype], self.ip, usrname, password)
             self.slots = self.device.get_crate_map() # initialize internal stuff
             self.sys_props = self.device.get_sys_prop_list()
-            print("Successfully initialized the CAEN HV Controller: ", self.device)
             if self.verbose:
-                self.print_system_info()
+                print("Successfully initialized the CAEN HV Controller: ", self.device)
         except hvwrapper.Error as e:
             # color helper removed — print plain message
             print("Failed to connect to the CAEN HV device. Please check the connection.")
@@ -81,29 +90,45 @@ class CAENHV():
         
     
     def reconfig(self):
+        # Prevent re-opening while the device is intentionally dispatched
+        if getattr(self, '_dispatched_until', 0) > time.time():
+            raise RuntimeError(f"Device is dispatched until {self._dispatched_until}; cannot re-open now")
+
         self.device = hvwrapper.Device.open(hvwrapper.SystemType[self.systemtype], hvwrapper.LinkType[self.linktype], self.ip, self.usrname, self.password)
         self.slots = self.device.get_crate_map()
         
     def disconnect(self):
+        """
+        Close the underlying device.
+        """
+
+
         try:
+            # attempt close; underlying wrapper may raise if the connection is already down
             self.device.close()
             if self.verbose:
-                print("trying to temperarily disconnect HV system")
-        except hvwrapper.Error as e:
-            if "CAENHV_InitSystem failed:" in str(e):
-                print("Failed to connect to the CAEN HV device. Please check the connection.")
-            elif "NOTCONNECTED" in str(e) and "Connection failed " in str(e):
+                print("Disconnected CAEN HV system")
+        except Exception as e:
+            msg = str(e)
+            if isinstance(e, hvwrapper.Error):
+                # Common library states that are safe to ignore
+                if "NOTCONNECTED" in msg or "Connection failed" in msg or "CFE server down" in msg:
+                    if self.verbose:
+                        print(f"Device already disconnected or connection failed during disconnect: {msg}")
+                else:
+                    if self.verbose:
+                        print(f"CAEN error during disconnect: {msg}")
+            else:
                 if self.verbose:
-                    print("system already disconnected")
+                    print(f"Error during disconnect: {msg}")
+        finally:
+            # Always clear the reference so Device.__del__ won't attempt to close again
+            try:
+                self.device = None
+            except Exception:
                 pass
         
-    def reconnect(self):
-        self.device.connect()
-        self.slots = self.device.get_crate_map()
-        if self.verbose:
-            print("Successfully reconnected the CAEN HV Controller: ", self.device)
-        
-    #@auto_connect_disconnect
+    @auto_connect_disconnect
     def print_system_info(self):
         sys_params = self.device.get_sys_prop_list()
         table = []
@@ -115,7 +140,7 @@ class CAENHV():
         else:
             print("System information: ", table)
         
-    #@auto_connect_disconnect
+    @auto_connect_disconnect
     def print_board_info(self, slot, param_list=[]):
         bd_params = self.device.get_bd_param_info(slot)
         table = []
@@ -135,7 +160,7 @@ class CAENHV():
         else:
             print("Board information: ", '/'.join(map(str, param_list)), table)
         
-    #@auto_connect_disconnect
+    @auto_connect_disconnect
     def print_crate_info(self, slotlist=[], chlist=[],  param_list=[]):
         
         #print("all slots ", list(enumerate(self.slots)))
@@ -185,7 +210,7 @@ class CAENHV():
                 print("Channel information: ", '/'.join(map(str, headers)), table)
             
         
-    #@auto_connect_disconnect
+    @auto_connect_disconnect
     def print_channel_info(self, slot, ch, param_list=['V0Set', 'I0Set', 'VMon','IMon','Status','Pw','Temp']):
         ch_params = self.device.get_ch_param_info(slot, ch)
         if len(param_list) == 0: 
@@ -208,7 +233,7 @@ class CAENHV():
             print("Channel information: ", '/'.join(map(str, param_list)), table)
             
         
-    #@auto_connect_disconnect
+    @auto_connect_disconnect
     def read_channel_param(self, slot, ch, param):
         """
         parameters: more detail in CAEN UM2463 doc
@@ -223,12 +248,18 @@ class CAENHV():
             raise KeyError(f"param for HVCANE is not in system parameter list: {param}; list: {self.sys_props}")
         param_prop = self.device.get_ch_param_prop(slot, ch, param)
         if param_prop.mode is not hvwrapper.ParamMode.WRONLY:
-            return round(self.device.get_ch_param(slot, [ch], param)[0], 2)
+            try:
+                return round(self.device.get_ch_param(slot, [ch], param)[0], 2)
+            except hvwrapper.Error as e:
+                # Return None to indicate read failure; callers should handle None.
+                if self.verbose:
+                    print(f"Failed to read channel param {param} (slot {slot} ch {ch}): {e}")
+                return None
         else:
             raise KeyError(f"mode of this parameter {param} in Slot {slot} Ch {ch} is wrong; Failed to set value in set_channel_param()")
         
     
-    #@auto_connect_disconnect
+    @auto_connect_disconnect
     def set_channel_param(self, slot, ch, param, value):
         """
          V0Set ,  I0Set ,  V1Set ,  I1Set ,  RUp ,  RDWn ,  Trip ,  SVMax ,  VMon ,  IMon ,  Status ,  
@@ -250,26 +281,32 @@ class CAENHV():
         else:
             raise KeyError(f"mode of this parameter {param} in Slot {slot} Ch {ch} is wrong; Failed to set value in set_channel_param()")
     
-    ####@auto_connect_disconnect
+    @auto_connect_disconnect
     def set_channel_HV(self, slot, ch, hv_value):
-        status = self.read_channel_param(slot, ch, 'Status')
+        status = self.device.get_ch_param(slot, [ch], 'Status')[0]
+        if status is None:
+            print(f"Warning: could not read Status for slot {slot} ch {ch}; aborting HV set")
+            return
         if status == 255:
             print(f"Error: Channel {ch} in slot {slot} is not in operating status: {status}, only updating V0Set")
-            self.set_channel_param(slot, ch, 'V0Set', hv_value)
+            self.device.set_ch_param(slot, [ch], 'V0Set', hv_value)
             return
-        current_hv = self.read_channel_param(slot, ch, 'VMon')
-        ramp_up = self.read_channel_param(slot, ch, 'RUp')
-        ramp_down = self.read_channel_param(slot, ch, 'RDWn')
+        current_hv = self.device.get_ch_param(slot, [ch], 'VMon')[0]
+        ramp_up = self.device.get_ch_param(slot, [ch], 'RUp')[0]
+        ramp_down = self.device.get_ch_param(slot, [ch], 'RDWn')[0]
+        if current_hv is None or ramp_up is None or ramp_down is None:
+            print(f"Warning: missing channel parameters for slot {slot} ch {ch} (VMon/RUp/RDwn); aborting HV set")
+            return
         nsecond = 0.0
         division_factor = 1.0
         if hv_value > current_hv:
             nsecond = ceil((hv_value - current_hv) / (ramp_up * division_factor))
         else:
             nsecond = ceil((current_hv - hv_value) / (ramp_down * division_factor))
-            
-        self.set_channel_param(slot, ch, 'V0Set', hv_value) # set the value for channel
+
+        self.device.set_ch_param(slot, [ch], 'V0Set', hv_value) # set the value for channel
         if status & 0x1 == 0: ## channel is off
-            self.set_channel_param(slot, ch, 'Pw', True) # enable the channel
+            self.device.set_ch_param(slot, [ch], 'Pw', True) # enable the channel
         print(f"Setting and Enabling HV of slot{slot} ch{ch} to {hv_value} V.... waiting for {nsecond} seconds...")
         time.sleep(nsecond+2) ## wait for ~10 seconds
         #param_list = ['V0Set', 'I0Set', 'VMon','IMon','Status','Pw','Temp']
@@ -277,53 +314,47 @@ class CAENHV():
             self.print_channel_info(slot, ch)
         #print(f"Status HV of slot{slot} ch{ch}: ", self.read_channel_param(slot, ch, 'VMon'))
     
-    ####@auto_connect_disconnect
+    #@auto_connect_disconnect
     def power_down_channel(self, slot, ch):
         self.set_channel_param(slot, ch, 'Pw', False)
         print(f"Power down channel {ch} in slot {slot}...")
         time.sleep(2)
-        if self.verbose:
-            self.print_channel_info(slot, ch)
     
-    ###@auto_connect_disconnect
+    #@auto_connect_disconnect
     def power_on_channel(self, slot, ch):   
         self.set_channel_param(slot, ch, 'Pw', True)
         print(f"Power on channel {ch} in slot {slot}...")
         time.sleep(2)
-        if self.verbose:
-            self.print_channel_info(slot, ch)
 
+    @auto_connect_disconnect
     def power_down_all_channels(self):
         for slot, board in enumerate(self.slots):
             if board is None:
                 continue
             for ch in range(board.n_channel):
-                status = self.read_channel_param(slot, ch, 'Status')
+                status = self.device.get_ch_param(slot, [ch], 'Status')[0]
                 if status & 0x1 == 1: ## channel is on
-                    self.set_channel_param(slot, ch, 'Pw', False)
+                    self.device.set_ch_param(slot, [ch], 'Pw', False)
         time.sleep(2)
-        if self.verbose:
-            self.print_crate_info([], [], ['V0Set', 'I0Set', 'VMon','IMon','Status','Pw','Temp'])
     
-    ####@auto_connect_disconnect
+    @auto_connect_disconnect
     def config_channel(self, slot, ch, V0Set, I0Set, V1Set=0, I1Set=1010, POn=False, PDwn=False, RampUp=20, RampDown=20, TripTime=10, SVMax=1000, ImRange=0, ZCDetect=True, ZCAdjust=False):
        
-        self.set_channel_param(slot, ch, 'V0Set', V0Set) # set the V0 value for channel
-        self.set_channel_param(slot, ch, 'I0Set', I0Set) # set the current limit for channel
-        self.set_channel_param(slot, ch, 'V1Set', V1Set)
-        self.set_channel_param(slot, ch, 'I1Set', I1Set)
-        self.set_channel_param(slot, ch, 'POn', POn) # ramp up to previous value / off when create is power-on/restarted
-        self.set_channel_param(slot, ch, 'PDwn', PDwn) # ramp down/kill when tripped 
-        self.set_channel_param(slot, ch, 'RUp', RampUp)
-        self.set_channel_param(slot, ch, 'RDWn', RampDown)
-        self.set_channel_param(slot, ch, 'Trip', TripTime)
-        self.set_channel_param(slot, ch, 'SVMax', SVMax)
-        self.set_channel_param(slot, ch, 'ImRange', ImRange)
-        self.set_channel_param(slot, ch, 'ZCDetect', ZCDetect)
-        self.set_channel_param(slot, ch, 'ZCAdjust', ZCAdjust)
+        self.device.set_ch_param(slot, [ch], 'V0Set', V0Set) # set the V0 value for channel
+        self.device.set_ch_param(slot, [ch], 'I0Set', I0Set) # set the current limit for channel
+        self.device.set_ch_param(slot, [ch], 'V1Set', V1Set)
+        self.device.set_ch_param(slot, [ch], 'I1Set', I1Set)
+        self.device.set_ch_param(slot, [ch], 'POn', POn) # ramp up to previous value / off when create is power-on/restarted
+        self.device.set_ch_param(slot, [ch], 'PDwn', PDwn) # ramp down/kill when tripped
+        self.device.set_ch_param(slot, [ch], 'RUp', RampUp)
+        self.device.set_ch_param(slot, [ch], 'RDWn', RampDown)
+        self.device.set_ch_param(slot, [ch], 'Trip', TripTime)
+        self.device.set_ch_param(slot, [ch], 'SVMax', SVMax)
+        self.device.set_ch_param(slot, [ch], 'ImRange', ImRange)
+        self.device.set_ch_param(slot, [ch], 'ZCDetect', ZCDetect)
+        self.device.set_ch_param(slot, [ch], 'ZCAdjust', ZCAdjust)
         print(f"Configured channel {ch} in slot {slot} with HV V0={V0Set} V and current I0={I0Set} uA")
         time.sleep(2)
-        self.print_channel_info(slot, ch, [])
         
     
     
@@ -346,7 +377,23 @@ if __name__ == '__main__':
     if hvcontroller.device is None:
         print("Failed to connect to the CAEN HV device. Please check the connection.")
         exit(1)
-    hvcontroller.power_on_channel(4, 0)
+    else:
+        print("Connected to CAEN HV device successfully.")
+        hvcontroller.print_crate_info([], [], ['V0Set', 'I0Set', 'VMon', 'IMon', 'Status', 'Pw', 'Temp'])
+
+    #hvcontroller.disconnect()
+        # sleep to simulate long wait (may cause CFE to drop); keep as-is but catch errors
+    Tottime = 66
+    while Tottime > 0:
+        wait_time = 5
+        print(f"Waiting for {wait_time} seconds... ({Tottime} seconds remaining): device {hvcontroller.device}")
+        #hvcontroller.print_system_info()
+        time.sleep(wait_time)
+        Tottime -= wait_time
+    
+    #hvcontroller.reconfig()
+
+    hvcontroller.set_channel_HV(4, 0, 100)
     hvcontroller.print_crate_info([], [], ['V0Set', 'I0Set', 'VMon','IMon','Status','Pw','Temp'])
     hvcontroller.power_down_all_channels()
-    #hvcontroller.disconnect()
+    hvcontroller.disconnect()
